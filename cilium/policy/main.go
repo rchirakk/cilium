@@ -34,6 +34,7 @@ import (
 
 	"github.com/codegangsta/cli"
 	l "github.com/op/go-logging"
+	"gopkg.in/yaml.v2"
 )
 
 var (
@@ -81,6 +82,12 @@ func init() {
 				Action:    dumpPolicy,
 				ArgsUsage: "<path>",
 				Before:    initEnv,
+				Flags: []cli.Flag{
+					cli.BoolFlag{
+						Name:  "yaml, y",
+						Usage: "Use YAML notation",
+					},
+				},
 			},
 			{
 				Name:      "delete",
@@ -364,13 +371,24 @@ func importPolicy(ctx *cli.Context) {
 	}
 }
 
-func prettyPrint(node *types.PolicyNode) {
+func prettyPrint(ctx *cli.Context, node *types.PolicyNode) {
 	if node == nil {
 		fmt.Println("No policy loaded.")
-	} else if b, err := json.MarshalIndent(node, "", "  "); err != nil {
-		fmt.Fprintf(os.Stderr, "Could not marshal response: %s\n", err)
+		return
+	}
+
+	if ctx.Bool("yaml") {
+		if b, err := yaml.Marshal(node); err != nil {
+			fmt.Fprintf(os.Stderr, "Could not marshal response: %s\n", err)
+		} else {
+			fmt.Printf("%s\n", b)
+		}
 	} else {
-		fmt.Printf("%s\n", b)
+		if b, err := json.MarshalIndent(node, "", "  "); err != nil {
+			fmt.Fprintf(os.Stderr, "Could not marshal response: %s\n", err)
+		} else {
+			fmt.Printf("%s\n", b)
+		}
 	}
 }
 
@@ -384,7 +402,7 @@ func validatePolicy(ctx *cli.Context) {
 
 		if ctx.Bool("dump") {
 			fmt.Printf("%s\n", node.DebugString(1))
-			prettyPrint(node)
+			prettyPrint(ctx, node)
 		}
 	}
 }
@@ -402,7 +420,7 @@ func dumpPolicy(ctx *cli.Context) {
 		os.Exit(1)
 	}
 
-	prettyPrint(n)
+	prettyPrint(ctx, n)
 }
 
 func deletePolicy(ctx *cli.Context) {
