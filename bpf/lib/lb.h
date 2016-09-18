@@ -51,6 +51,8 @@ __BPF_MAP(cilium_lb4_services, BPF_MAP_TYPE_HASH, 0,
 	  sizeof(struct lb4_key), sizeof(struct lb4_service),
 	  PIN_GLOBAL_NS, CILIUM_LB_MAP_SIZE);
 
+#define REV_NAT_F_TUPLE_SADDR 1
+
 static inline int lb_select_slave(struct __sk_buff *skb, __u16 count)
 {
 	__be16 hash = get_hash_recalc(skb);
@@ -63,7 +65,8 @@ static inline int lb_select_slave(struct __sk_buff *skb, __u16 count)
 	return slave;
 }
 
-static inline int extract_l4_port(struct __sk_buff *skb, __u8 nexthdr, int l4_off, __u16 *port)
+static inline int __inline__ extract_l4_port(struct __sk_buff *skb, __u8 nexthdr,
+					     int l4_off, __u16 *port)
 {
 	int ret;
 
@@ -124,46 +127,61 @@ static inline int __inline__ reverse_map_l4_port(struct __sk_buff *skb, __u8 nex
 	return 0;
 }
 
-/** Perform IPv6 DSR SNAT based on reverse NAT index
+/** Perform IPv6 reverse NAT based on reverse NAT index
  * @arg skb		packet
  * @arg l4_off		offset to L4
  * @arg csum_off	offset to L4 checksum field
  * @arg csum_flags	checksum flags
  * @arg index		reverse NAT index
  * @arg tuple		tuple
+ * @arg saddr_tuple	If set, tuple address will be updated with new source address
  */
-static inline int lb6_dsr_snat(struct __sk_buff *skb, int l4_off,
-			       struct csum_offset *csum_off, __u16 index,
-			       struct ipv6_ct_tuple *tuple)
+static inline int __inline__ lb6_rev_nat(struct __sk_buff *skb, int l4_off,
+					 struct csum_offset *csum_off, __u16 index,
+					 struct ipv6_ct_tuple *tuple, int flags)
 {
-	union v6addr tmp, sip;
 	struct lb6_reverse_nat *nat;
+	union v6addr old_saddr;
+	__u8 *new_saddr;
 	__be32 sum;
 	int ret;
+	__u32 addr;
+	__u16 port;
 
 	cilium_trace(skb, DBG_LB6_REVERSE_NAT_LOOKUP, index, 0);
 	nat = map_lookup_elem(&cilium_lb6_reverse_nat, &index);
-	if (nat == NULL) {
+	if (nat == NULL)
 		return 0;
-	}
 
-	cilium_trace(skb, DBG_LB6_REVERSE_NAT, nat->address.p4, nat->port);
+	addr = nat->address.p4;	
+	port = nat->port;
+	cilium_trace(skb, DBG_LB6_REVERSE_NAT, addr, port);
 
-	if (nat->port) {
-		ret = reverse_map_l4_port(skb, tuple->nexthdr, nat->port, l4_off, csum_off);
+	if (port) {
+		ret = reverse_map_l4_port(skb, tuple->nexthdr, port, l4_off, csum_off);
 		if (IS_ERR(ret))
 			return ret;
 	}
 
-	if (ipv6_load_saddr(skb, ETH_HLEN, &sip) < 0)
-		return DROP_INVALID;
+	if (flags & REV_NAT_F_TUPLE_SADDR) {
+		ipv6_addr_copy(&old_saddr, &tuple->addr);
+		ipv6_addr_copy(&tuple->addr, &nat->address);
+		new_saddr = tuple->addr.addr;
+	} else {
+		union v6addr tmp;
 
-	ipv6_addr_copy(&tmp, &nat->address);
-	ret = ipv6_store_saddr(skb, tmp.addr, ETH_HLEN);
+		if (ipv6_load_saddr(skb, ETH_HLEN, &old_saddr) < 0)
+			return DROP_INVALID;
+
+		ipv6_addr_copy(&tmp, &nat->address);
+		new_saddr = tmp.addr;
+	}
+
+	ret = ipv6_store_saddr(skb, new_saddr, ETH_HLEN);
 	if (IS_ERR(ret))
 		return DROP_WRITE_ERROR;
 
-	sum = csum_diff(sip.addr, 16, tmp.addr, 16, 0);
+	sum = csum_diff(old_saddr.addr, 16, new_saddr, 16, 0);
 	if (csum_l4_replace(skb, l4_off, csum_off, 0, sum, BPF_F_PSEUDO_HDR) < 0)
 		return DROP_CSUM_L4;
 
@@ -276,7 +294,8 @@ static inline int __inline__ lb6_xlate(struct __sk_buff *skb, union v6addr *new_
 
 static inline int __inline__ lb6_local(struct __sk_buff *skb, int l3_off, int l4_off,
 				       struct csum_offset *csum_off, struct lb6_key *key,
-				       struct ipv6_ct_tuple *tuple, struct lb6_service *svc)
+				       struct ipv6_ct_tuple *tuple, struct lb6_service *svc,
+				       __u16 *rev_nat_index)
 {
 	__u16 slave;
 
@@ -286,12 +305,15 @@ static inline int __inline__ lb6_local(struct __sk_buff *skb, int l3_off, int l4
 
 	ipv6_addr_copy(&tuple->addr, &svc->target);
 
+	if (rev_nat_index)
+		*rev_nat_index = svc->rev_nat_index;
+
 	return lb6_xlate(skb, &tuple->addr, tuple->nexthdr, l3_off, l4_off,
 			 csum_off, key, svc);
 }
 
 
-/** Perform IPv4 DSR SNAT based on reverse NAT index
+/** Perform IPv4 reverse NAT based on reverse NAT index
  * @arg skb		packet
  * @arg l3_off		offset to L3
  * @arg l4_off		offset to L4
@@ -300,9 +322,9 @@ static inline int __inline__ lb6_local(struct __sk_buff *skb, int l3_off, int l4
  * @arg index		reverse NAT index
  * @arg tuple		tuple
  */
-static inline int lb4_dsr_snat(struct __sk_buff *skb, int l3_off, int l4_off,
-			       struct csum_offset *csum_off, __u16 index,
-			       struct ipv4_ct_tuple *tuple)
+static inline int __inline__ lb4_rev_nat(struct __sk_buff *skb, int l3_off, int l4_off,
+					 struct csum_offset *csum_off, __u16 index,
+					 struct ipv4_ct_tuple *tuple, int flags)
 {
 	__be32 old_sip, new_sip;
 	struct lb4_reverse_nat *nat;
@@ -311,9 +333,8 @@ static inline int lb4_dsr_snat(struct __sk_buff *skb, int l3_off, int l4_off,
 
 	cilium_trace(skb, DBG_LB4_REVERSE_NAT_LOOKUP, index, 0);
 	nat = map_lookup_elem(&cilium_lb4_reverse_nat, &index);
-	if (nat == NULL) {
+	if (nat == NULL)
 		return 0;
-	}
 
 	cilium_trace(skb, DBG_LB4_REVERSE_NAT, nat->address, nat->port);
 
@@ -323,11 +344,17 @@ static inline int lb4_dsr_snat(struct __sk_buff *skb, int l3_off, int l4_off,
 			return ret;
 	}
 
-        ret = skb_load_bytes(skb, l3_off + offsetof(struct iphdr, saddr), &old_sip, 4);
-	if (IS_ERR(ret))
-		return ret;
+	if (flags & REV_NAT_F_TUPLE_SADDR) {
+		old_sip = tuple->addr;
+		tuple->addr = new_sip = nat->address;
+	} else {
+		ret = skb_load_bytes(skb, l3_off + offsetof(struct iphdr, saddr), &old_sip, 4);
+		if (IS_ERR(ret))
+			return ret;
 
-	new_sip = nat->address;
+		new_sip = nat->address;
+	}
+
         ret = skb_store_bytes(skb, l3_off + offsetof(struct iphdr, saddr), &new_sip, 4, 0);
 	if (IS_ERR(ret))
 		return DROP_WRITE_ERROR;
