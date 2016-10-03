@@ -1,0 +1,5 @@
+---
+
+- name: cleanup iproute2 sources
+  shell: \rm -Rf /home/vagrant/iproute2
+  ignore_errors: yes

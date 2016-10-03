@@ -1,0 +1,16 @@
+---
+# ansible-playbook -u vagrant --skip-tags=common:delete site.yml
+# ansible-playbook -u vagrant --tags=common:delete site.yml
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  roles:
+    - { role: common, tags: common }
+    - { role: kernel, tags: kernel }
+    - { role: iproute2, tags: iproute2 }
+    - { role: docker, tags: docker }
+    - { role: clang, tags: clang }
+    - { role: reboot, tags: reboot }
+    - { role: cleanup, tags: cleanup }

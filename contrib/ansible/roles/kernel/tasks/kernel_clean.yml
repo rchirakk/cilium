@@ -1,0 +1,5 @@
+---
+
+- name: Delete kernel sources
+  shell: \rm -Rf /home/vagrant/net-next
+  ignore_errors: yes
